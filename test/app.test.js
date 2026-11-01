@@ -4,6 +4,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { DatabaseSync } from "node:sqlite";
 process.env.NODE_ENV = "test";
+// Render's generated HTTPS origin must work without manually setting APP_URL.
+delete process.env.APP_URL;
+process.env.RENDER_EXTERNAL_URL = "https://gpeit-test.onrender.com";
 process.env.DATA_DIR = mkdtempSync(`${tmpdir()}/gpeit-test-`);
 const { server, reminders } = await import("../server.js");
 let base;
@@ -29,6 +32,7 @@ async function call(path, method = "GET", body, cookie, headers = {}) {
     status: r.status,
     body: await r.json(),
     cookie: r.headers.get("set-cookie")?.split(";")[0],
+    setCookie: r.headers.get("set-cookie"),
   };
 }
 const account = (email) => ({
@@ -43,9 +47,16 @@ test("authenticated tools preserve ownership and persist useful data", async () 
       .status,
     400,
   );
-  const a = await call("/auth/register", "POST", account("alex@example.com"));
+  const a = await call(
+    "/auth/register",
+    "POST",
+    account("alex@example.com"),
+    undefined,
+    { origin: process.env.RENDER_EXTERNAL_URL },
+  );
   assert.equal(a.status, 200);
   assert.ok(a.cookie);
+  assert.match(a.setCookie, /; Secure/);
   const b = await call("/auth/register", "POST", account("sam@example.com"));
   assert.equal(b.status, 200);
   assert.equal(

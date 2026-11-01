@@ -28,7 +28,11 @@ const run = (sql, ...p) => db.prepare(sql).run(...p);
 const one = (sql, ...p) => db.prepare(sql).get(...p);
 const all = (sql, ...p) => db.prepare(sql).all(...p);
 const hash = (s) => createHash("sha256").update(s).digest("hex");
-const appUrl = process.env.APP_URL || "http://localhost:3000";
+const appUrl = new URL(
+  process.env.APP_URL ||
+    process.env.RENDER_EXTERNAL_URL ||
+    "http://localhost:3000",
+).origin;
 const secure = appUrl.startsWith("https:");
 const cookie = (t) =>
   `session=${t}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000${secure ? "; Secure" : ""}`;

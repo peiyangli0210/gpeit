@@ -1,0 +1,22 @@
+# Single-instance deployment: SQLite and the reminder worker share this disk.
+# Render charges for the Starter instance and persistent disk; review in its UI.
+services:
+  - type: web
+    name: gpeit
+    runtime: node
+    plan: starter
+    numInstances: 1
+    buildCommand: node --version && npm test
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "24"
+      - key: NODE_ENV
+        value: production
+      - key: DATA_DIR
+        value: /var/data
+    disk:
+      name: gpeit-data
+      mountPath: /var/data
+      sizeGB: 1

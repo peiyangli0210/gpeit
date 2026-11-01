@@ -13,6 +13,18 @@ npm start
 
 Port defaults to 3000. Create an account in the app. Data persists in `data/app.sqlite` (ignored by Git); `DATA_DIR` overrides its directory. Do not commit database files or `.env`. Use `npm run dev` for server restart on file changes. The reminder worker runs every 30 seconds as part of the server; overdue reminders are processed on restart. Do not rely on a stopped development server to deliver reminders.
 
+## Deploy to Render
+
+[Deploy to Render](https://render.com/deploy?repo=https://github.com/peiyangli0210/gpeit)
+
+The repository includes `render.yaml`, which configures Node 24, a single Starter web instance, a 1 GB persistent disk at `/var/data`, the startup command, and a build-time integration test. **The web instance and disk are paid resources. Review Render’s current price before confirming deployment.** The disk is required to preserve accounts, tasks, and food records across deployments; do not switch to an ephemeral filesystem for real data.
+
+Open the deployment link, sign into Render, authorize GitHub access if requested, and review/create the Blueprint. Render assigns the app an HTTPS address, which the server reads from `RENDER_EXTERNAL_URL` automatically for secure cookies, request-origin checks and OAuth callbacks. You do not need to manually copy the generated address into `APP_URL`. For a custom domain, set `APP_URL` to its exact HTTPS origin and update the Google OAuth redirect URI. The initial deployment creates an empty database; local development accounts are not transferred.
+
+After Render marks the service live, open its HTTPS URL and create an account, add/complete a task, log a food entry and verify its calorie total. Restart the service and confirm your data remains. Deployment is not verified until these checks pass on the hosted service. This is intended for private MVP testing; see the production limitations below before public signups.
+
+Add optional integration credentials through Render’s secure environment-variable settings; never place real keys in `render.yaml`. The core tools work before integrations are configured. Enable backups for the persistent data and keep the service at one instance until the database and worker are redesigned for multiple replicas.
+
 ## Optional services
 
 Copy `.env.example` to `.env`, fill values securely, and restart the server. Core accounts, tasks, journals, in-app messages and in-app reminders need no external credentials. Settings shows connection status. Never paste credentials into chat or commit them.
