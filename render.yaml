@@ -14,6 +14,8 @@ services:
         value: "24"
       - key: NODE_ENV
         value: production
+      - key: AI_KEY_ENCRYPTION_SECRET
+        generateValue: true
       - key: DATA_DIR
         value: /var/data
     disk:

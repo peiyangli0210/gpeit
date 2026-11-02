@@ -9,9 +9,11 @@ import {
 import { mkdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { tools } from "./tools.js";
+import { personalAIAvailable, encryptAIKey, decryptAIKey } from "./ai-keys.js";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
-mkdirSync(process.env.DATA_DIR || `${root}data`, { recursive: true });
+const dataDirectory = process.env.DATA_DIR || `${root}data`;
+mkdirSync(dataDirectory, { recursive: true, mode: 0o700 });
 const db = new DatabaseSync(
   `${process.env.DATA_DIR || `${root}data`}/app.sqlite`,
 );
@@ -23,6 +25,7 @@ CREATE TABLE IF NOT EXISTS foods(id INTEGER PRIMARY KEY,user_id INTEGER REFERENC
 CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY,user_id INTEGER REFERENCES users(id),tool TEXT NOT NULL,body TEXT NOT NULL,created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS settings(user_id INTEGER PRIMARY KEY REFERENCES users(id),goal INTEGER DEFAULT 2000,google_refresh TEXT);
 CREATE TABLE IF NOT EXISTS calendar_jobs(event_id TEXT PRIMARY KEY,user_id INTEGER REFERENCES users(id),task_id INTEGER,operation TEXT NOT NULL,payload TEXT NOT NULL,attempts INTEGER DEFAULT 0,next_attempt INTEGER DEFAULT 0,last_error TEXT);
+CREATE TABLE IF NOT EXISTS ai_connections(user_id INTEGER PRIMARY KEY REFERENCES users(id),encrypted_key TEXT NOT NULL,model TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS oauth_states(state TEXT PRIMARY KEY,user_id INTEGER REFERENCES users(id),expires INTEGER NOT NULL);
 `);
 // Additive migration preserves existing accounts and Calendar connections.
@@ -305,6 +308,62 @@ async function drainCalendar() {
     }
   }
 }
+function aiStatus(uid) {
+  const connection = one(
+    "SELECT model FROM ai_connections WHERE user_id=?",
+    uid,
+  );
+  return {
+    connected: !!connection,
+    model: connection?.model || process.env.GPT_MODEL || "gpt-4.1-mini",
+    source: connection
+      ? "personal"
+      : process.env.GPT_API_KEY
+        ? "shared"
+        : "none",
+    personalAvailable: personalAIAvailable(),
+  };
+}
+async function openAI(path, key, options = {}) {
+  let response;
+  try {
+    response = await fetch(`https://api.openai.com/v1/${path}`, {
+      ...options,
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+      },
+      signal: AbortSignal.timeout(20000),
+    });
+  } catch {
+    fail(502, "OpenAI could not be reached. Please try again.");
+  }
+  // Never return upstream bodies: they can echo credentials or submitted content.
+  if (!response.ok) {
+    if (response.status === 401)
+      fail(
+        400,
+        "OpenAI rejected this API key. Replace it in Settings → AI connection.",
+      );
+    if (response.status === 403 || response.status === 404)
+      fail(
+        400,
+        "This API key cannot access the selected model. Check the model ID and account permissions.",
+      );
+    if (response.status === 429)
+      fail(
+        429,
+        "OpenAI usage or rate limit reached. Check API billing and limits; ChatGPT subscriptions do not include API credits.",
+      );
+    if (response.status === 400)
+      fail(
+        400,
+        "OpenAI could not run this model with the analysis request. Choose a model that supports the Responses API.",
+      );
+    fail(502, "OpenAI could not complete the request. Please try again.");
+  }
+  return response.json();
+}
 const limits = new Map();
 function rate(key, max = 20) {
   const now = Date.now();
@@ -441,14 +500,60 @@ export const server = http.createServer(async (req, res) => {
         email: u.email,
         goal: s.goal,
         tools,
+        aiConnection: aiStatus(uid),
         integrations: {
-          ai: !!process.env.GPT_API_KEY,
+          ai:
+            !!one("SELECT user_id FROM ai_connections WHERE user_id=?", uid) ||
+            !!process.env.GPT_API_KEY,
           email: emailReady(),
           googleAvailable: googleReady(),
           google: hasGoogleScope(uid, CALENDAR_SCOPE),
           gmail: hasGoogleScope(uid, GMAIL_SCOPE),
         },
       });
+      return;
+    }
+    if (p === "/api/ai-connection" && req.method === "GET") {
+      json(aiStatus(uid));
+      return;
+    }
+    if (p === "/api/ai-connection" && req.method === "PUT") {
+      rate(`ai-settings:${uid}`, 20);
+      if (!personalAIAvailable())
+        fail(
+          503,
+          "Personal AI connections need an AI_KEY_ENCRYPTION_SECRET configured by the administrator.",
+        );
+      const b = await body(req),
+        model = str(b.model, 100);
+      if (!/^[A-Za-z0-9][A-Za-z0-9._:-]*$/.test(model))
+        fail(400, "Enter a valid OpenAI model ID.");
+      const current = one("SELECT * FROM ai_connections WHERE user_id=?", uid);
+      const newKey = b.key !== undefined && b.key !== "";
+      if (
+        newKey &&
+        (typeof b.key !== "string" || !/^sk-[A-Za-z0-9_-]{17,509}$/.test(b.key))
+      )
+        fail(400, "Enter a valid OpenAI API key.");
+      if (!newKey && !current)
+        fail(400, "Enter your OpenAI API key to connect.");
+      const key = newKey
+        ? b.key
+        : decryptAIKey(current.encrypted_key, uid, dataDirectory);
+      await openAI(`models/${encodeURIComponent(model)}`, key);
+      const encrypted = encryptAIKey(key, uid, dataDirectory);
+      run(
+        "INSERT INTO ai_connections(user_id,encrypted_key,model) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET encrypted_key=excluded.encrypted_key,model=excluded.model",
+        uid,
+        encrypted,
+        model,
+      );
+      json(aiStatus(uid));
+      return;
+    }
+    if (p === "/api/ai-connection" && req.method === "DELETE") {
+      run("DELETE FROM ai_connections WHERE user_id=?", uid);
+      json(aiStatus(uid));
       return;
     }
     if (p === "/api/settings" && req.method === "PATCH") {
@@ -640,11 +745,21 @@ export const server = http.createServer(async (req, res) => {
       return;
     }
     if (p === "/api/analyze" && req.method === "POST") {
-      if (!process.env.GPT_API_KEY)
+      const connection = one(
+        "SELECT * FROM ai_connections WHERE user_id=?",
+        uid,
+      );
+      if (!connection && !process.env.GPT_API_KEY)
         fail(
           503,
-          "GPT analysis needs a GPT_API_KEY configured by the app administrator.",
+          "Connect your OpenAI API key in Settings → AI connection to use analysis.",
         );
+      // Never fall back to shared billing when a personal connection fails.
+      const key = connection
+        ? decryptAIKey(connection.encrypted_key, uid, dataDirectory)
+        : process.env.GPT_API_KEY;
+      const model =
+        connection?.model || process.env.GPT_MODEL || "gpt-4.1-mini";
       rate(`ai:${uid}`, 20);
       const b = await body(req),
         tool = tools.find((t) => t.id === b.tool);
@@ -660,14 +775,10 @@ export const server = http.createServer(async (req, res) => {
               uid,
               date(b.date),
             );
-      const result = await external("https://api.openai.com/v1/responses", {
+      const result = await openAI("responses", key, {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${process.env.GPT_API_KEY}`,
-          "Content-Type": "application/json",
-        },
         body: JSON.stringify({
-          model: process.env.GPT_MODEL || "gpt-4.1-mini",
+          model,
           instructions: tool.analysisPrompt,
           input: JSON.stringify(data),
           max_output_tokens: 600,

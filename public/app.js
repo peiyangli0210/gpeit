@@ -215,6 +215,37 @@ function render() {
       toast(err.message);
     }
   });
+  $("#ai-form")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const form = e.target,
+      button = form.querySelector('button[type="submit"]');
+    const key = form.elements.apiKey.value;
+    const model = form.elements.model.value.trim();
+    form.elements.apiKey.value = "";
+    button.disabled = true;
+    $("#ai-error").textContent = "";
+    try {
+      await api("/ai-connection", "PUT", { ...(key ? { key } : {}), model });
+      await load();
+      toast("Personal AI connection verified and saved");
+    } catch (err) {
+      $("#ai-error").textContent = err.message;
+    } finally {
+      button.disabled = false;
+    }
+  });
+  $("#remove-ai")?.addEventListener("click", () => {
+    const f = openDialog(
+      "Remove personal AI connection?",
+      `<p>The saved key will be removed from this app. Analysis will use the shared app connection if one is available. This does not revoke your key at OpenAI.</p>`,
+      "Remove connection",
+    );
+    f.onsubmit = (e) =>
+      saveDialog(e, async () => {
+        await api("/ai-connection", "DELETE");
+        user = await api("/me");
+      });
+  });
   $("#goal-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     await action(() =>
@@ -260,7 +291,7 @@ function inboxView() {
 }
 function settingsView() {
   const i = user.integrations;
-  return `<div class="settings-grid"><section class="card"><h2>Your account</h2><label>Name<input readonly value="${esc(user.name)}"></label><label>Email<input readonly value="${esc(user.email)}"></label><p class="hint">Email/password sign-in is active. Email ownership verification and password recovery are not included in this first version.</p></section><section class="card"><h2>Daily calorie reference</h2><p>A reference you choose for your journal.</p><form id="goal-form"><label>Calories per day<input name="goal" type="number" min="1" max="20000" required value="${user.goal}"></label><button class="primary">Save preference</button></form></section><section class="card connections"><h2>Connections</h2>${[
+  return `<div class="settings-grid"><section class="card"><h2>Your account</h2><label>Name<input readonly value="${esc(user.name)}"></label><label>Email<input readonly value="${esc(user.email)}"></label><p class="hint">Email/password sign-in is active. Email ownership verification and password recovery are not included in this first version.</p></section><section class="card"><h2>Daily calorie reference</h2><p>A reference you choose for your journal.</p><form id="goal-form"><label>Calories per day<input name="goal" type="number" min="1" max="20000" required value="${user.goal}"></label><button class="primary">Save preference</button></form></section>${aiSettings()}<section class="card connections"><h2>Connections</h2>${[
     [
       "Google Calendar",
       i.google
@@ -280,6 +311,17 @@ function settingsView() {
     .join(
       "",
     )}<button class="secondary" id="connect-google">Connect Google: Calendar & Gmail →</button>${i.google ? '<button class="text-button" id="disconnect-google">Disconnect Google</button>' : ""}</section><section class="card"><span class="spark">✳</span><h2>Built to grow.</h2><p>Every tool shares your account, messaging, and AI analysis. Add new tool definitions to expand your workspace.</p><p class="hint">An administrator configures optional services on the server. Credentials never belong in the browser.</p></section></div>`;
+}
+function aiSettings() {
+  const ai = user.aiConnection;
+  return `<section class="card"><h2>AI connection</h2><p>${ai.source === "personal" ? "Analysis uses your personal OpenAI API account." : ai.source === "shared" ? "Analysis currently uses the shared app account." : "Connect your API account to enable analysis."}</p>
+    <p class="hint">OpenAI API usage is billed separately from ChatGPT Free, Plus, and Pro. Your selected tool data is sent to OpenAI only when you request analysis. <a class="text-button" href="https://platform.openai.com/api-keys" target="_blank" rel="noopener noreferrer">Create an API key →</a></p>
+    ${!ai.personalAvailable ? '<p class="error">Personal connections need server setup. Ask the administrator to configure AI_KEY_ENCRYPTION_SECRET.</p>' : ""}
+    <form id="ai-form"><label>OpenAI API key<input type="password" name="apiKey" autocomplete="off" spellcheck="false" autocapitalize="none" maxlength="512" ${ai.connected ? "" : "required"} ${ai.personalAvailable ? "" : "disabled"} placeholder="${ai.connected ? "Leave blank to keep your saved key" : "sk-…"}"></label>
+    <label>Analysis model<input name="model" required maxlength="100" list="ai-models" value="${esc(ai.model)}" ${ai.personalAvailable ? "" : "disabled"}></label>
+    <datalist id="ai-models"><option value="gpt-4.1-mini"></option><option value="gpt-4.1"></option><option value="gpt-4o-mini"></option></datalist>
+    <p class="hint">Enter a Responses API model available to your API account. Saving checks key and model access. Your key is encrypted on the server and is never returned to this page. No API key is stored in browser storage.</p>
+    <p id="ai-error" class="error" role="alert"></p><div class="actions"><button class="primary" type="submit" ${ai.personalAvailable ? "" : "disabled"}>Verify and save</button>${ai.connected ? '<button class="secondary" id="remove-ai" type="button">Remove connection</button>' : ""}</div></form></section>`;
 }
 function openDialog(title, content, submit) {
   const d = $("#dialog");
