@@ -22,8 +22,20 @@ CREATE TABLE IF NOT EXISTS todos(id INTEGER PRIMARY KEY,user_id INTEGER REFERENC
 CREATE TABLE IF NOT EXISTS foods(id INTEGER PRIMARY KEY,user_id INTEGER REFERENCES users(id),name TEXT NOT NULL,calories INTEGER NOT NULL,date TEXT NOT NULL,meal TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY,user_id INTEGER REFERENCES users(id),tool TEXT NOT NULL,body TEXT NOT NULL,created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS settings(user_id INTEGER PRIMARY KEY REFERENCES users(id),goal INTEGER DEFAULT 2000,google_refresh TEXT);
+CREATE TABLE IF NOT EXISTS calendar_jobs(event_id TEXT PRIMARY KEY,user_id INTEGER REFERENCES users(id),task_id INTEGER,operation TEXT NOT NULL,payload TEXT NOT NULL,attempts INTEGER DEFAULT 0,next_attempt INTEGER DEFAULT 0,last_error TEXT);
 CREATE TABLE IF NOT EXISTS oauth_states(state TEXT PRIMARY KEY,user_id INTEGER REFERENCES users(id),expires INTEGER NOT NULL);
 `);
+// Additive migration preserves existing accounts and Calendar connections.
+if (
+  !db
+    .prepare("PRAGMA table_info(settings)")
+    .all()
+    .some((c) => c.name === "google_scopes")
+) {
+  db.exec(
+    "ALTER TABLE settings ADD COLUMN google_scopes TEXT NOT NULL DEFAULT 'https://www.googleapis.com/auth/calendar.events'",
+  );
+}
 const run = (sql, ...p) => db.prepare(sql).run(...p);
 const one = (sql, ...p) => db.prepare(sql).get(...p);
 const all = (sql, ...p) => db.prepare(sql).all(...p);
@@ -120,6 +132,178 @@ async function googleToken(uid) {
       }),
     })
   ).access_token;
+}
+const CALENDAR_SCOPE = "https://www.googleapis.com/auth/calendar.events";
+const GMAIL_SCOPE = "https://www.googleapis.com/auth/gmail.send";
+function hasGoogleScope(uid, scope) {
+  const s = one(
+    "SELECT google_refresh,google_scopes FROM settings WHERE user_id=?",
+    uid,
+  );
+  return !!s?.google_refresh && s.google_scopes.split(" ").includes(scope);
+}
+async function sendGmail(uid, to, subject, text) {
+  if (!hasGoogleScope(uid, GMAIL_SCOPE))
+    fail(409, "Reconnect Google and allow Gmail sending permission first.");
+  const access = await googleToken(uid);
+  // Encode all user-controlled headers/body to prevent MIME header injection.
+  if (
+    !/^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/.test(
+      to,
+    ) ||
+    to.length > 254
+  )
+    fail(400, "Enter one valid recipient email address.");
+  const mime = [
+    `To: ${to}`,
+    `Subject: =?UTF-8?B?${Buffer.from(subject).toString("base64")}?=`,
+    "MIME-Version: 1.0",
+    "Content-Type: text/plain; charset=UTF-8",
+    "Content-Transfer-Encoding: base64",
+    "",
+    Buffer.from(text)
+      .toString("base64")
+      .match(/.{1,76}/g)
+      .join("\r\n"),
+  ].join("\r\n");
+  await external(
+    "https://gmail.googleapis.com/gmail/v1/users/me/messages/send",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${access}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ raw: Buffer.from(mime).toString("base64url") }),
+    },
+  );
+}
+function transaction(fn) {
+  db.exec("BEGIN");
+  try {
+    const result = fn();
+    db.exec("COMMIT");
+    return result;
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
+  }
+}
+function queueCalendar(t, operation) {
+  const eventId = t.event_id || randomBytes(16).toString("hex");
+  if (operation === "create")
+    run(
+      "UPDATE todos SET event_id=? WHERE id=? AND user_id=?",
+      eventId,
+      t.id,
+      t.user_id,
+    );
+  run(
+    `INSERT INTO calendar_jobs(event_id,user_id,task_id,operation,payload) VALUES(?,?,?,?,?)
+    ON CONFLICT(event_id) DO UPDATE SET operation=excluded.operation,payload=excluded.payload,attempts=0,next_attempt=0,last_error=NULL`,
+    eventId,
+    t.user_id,
+    t.id,
+    operation,
+    JSON.stringify(t),
+  );
+}
+let calendarProcessing;
+export function processCalendarQueue() {
+  if (calendarProcessing) return calendarProcessing;
+  calendarProcessing = drainCalendar().finally(() => {
+    calendarProcessing = null;
+  });
+  return calendarProcessing;
+}
+async function drainCalendar() {
+  for (const job of all(
+    `SELECT calendar_jobs.* FROM calendar_jobs JOIN settings ON settings.user_id=calendar_jobs.user_id
+      WHERE next_attempt<=? AND settings.google_refresh IS NOT NULL
+      AND instr(' ' || settings.google_scopes || ' ', ' ${CALENDAR_SCOPE} ') > 0
+      ORDER BY calendar_jobs.rowid LIMIT 100`,
+    Date.now(),
+  )) {
+    if (!hasGoogleScope(job.user_id, CALENDAR_SCOPE)) continue;
+    try {
+      const access = await googleToken(job.user_id),
+        t = JSON.parse(job.payload);
+      const deleting = job.operation === "delete";
+      const response = await fetch(
+        "https://www.googleapis.com/calendar/v3/calendars/primary/events" +
+          (deleting ? "/" + encodeURIComponent(job.event_id) : ""),
+        {
+          method: deleting ? "DELETE" : "POST",
+          signal: AbortSignal.timeout(20000),
+          headers: {
+            Authorization: `Bearer ${access}`,
+            "Content-Type": "application/json",
+          },
+          ...(deleting
+            ? {}
+            : {
+                body: JSON.stringify({
+                  id: job.event_id,
+                  summary: t.title,
+                  start: { dateTime: t.due },
+                  end: {
+                    dateTime: new Date(
+                      Date.parse(t.due) + 1800000,
+                    ).toISOString(),
+                  },
+                  reminders: t.remind
+                    ? {
+                        useDefault: false,
+                        overrides: [
+                          {
+                            method: "popup",
+                            minutes: Math.max(
+                              0,
+                              Math.min(
+                                40320,
+                                Math.round(
+                                  (Date.parse(t.due) - Date.parse(t.remind)) /
+                                    60000,
+                                ),
+                              ),
+                            ),
+                          },
+                        ],
+                      }
+                    : { useDefault: true },
+                }),
+              }),
+        },
+      );
+      if (
+        !response.ok &&
+        !(deleting ? [404, 410] : [409]).includes(response.status)
+      )
+        throw new Error(
+          "Google Calendar returned " +
+            response.status +
+            ". Check permissions or reconnect Google.",
+        );
+      // A delete can replace an in-flight create. Keep that newer job for the next pass.
+      run(
+        "DELETE FROM calendar_jobs WHERE event_id=? AND operation=?",
+        job.event_id,
+        job.operation,
+      );
+    } catch (e) {
+      run(
+        "UPDATE calendar_jobs SET attempts=attempts+1,next_attempt=?,last_error=? WHERE event_id=? AND operation=?",
+        Date.now() + Math.min(3600000, 30000 * 2 ** Math.min(job.attempts, 7)),
+        e.status
+          ? e.message
+          : e.message?.startsWith("Google Calendar returned")
+            ? e.message
+            : "Calendar unavailable. We will retry automatically.",
+        job.event_id,
+        job.operation,
+      );
+    }
+  }
 }
 const limits = new Map();
 function rate(key, max = 20) {
@@ -261,7 +445,8 @@ export const server = http.createServer(async (req, res) => {
           ai: !!process.env.GPT_API_KEY,
           email: emailReady(),
           googleAvailable: googleReady(),
-          google: !!s.google_refresh,
+          google: hasGoogleScope(uid, CALENDAR_SCOPE),
+          gmail: hasGoogleScope(uid, GMAIL_SCOPE),
         },
       });
       return;
@@ -290,15 +475,21 @@ export const server = http.createServer(async (req, res) => {
         remind = instant(b.remind);
       if (remind && Date.parse(remind) < Date.now())
         fail(400, "Set a reminder in the future.");
-      const id = Number(
-        run(
-          "INSERT INTO todos(user_id,title,due,remind) VALUES(?,?,?,?)",
-          uid,
-          title,
-          due,
-          remind,
-        ).lastInsertRowid,
-      );
+      const id = transaction(() => {
+        const id = Number(
+          run(
+            "INSERT INTO todos(user_id,title,due,remind) VALUES(?,?,?,?)",
+            uid,
+            title,
+            due,
+            remind,
+          ).lastInsertRowid,
+        );
+        if (due && hasGoogleScope(uid, CALENDAR_SCOPE))
+          queueCalendar(one("SELECT * FROM todos WHERE id=?", id), "create");
+        return id;
+      });
+      await processCalendarQueue();
       json(one("SELECT * FROM todos WHERE id=?", id), 201);
       return;
     }
@@ -313,64 +504,23 @@ export const server = http.createServer(async (req, res) => {
       if (todo[2] && req.method === "POST") {
         if (!t.due)
           fail(400, "Set a due time before adding this task to Calendar.");
-        if (t.event_id) {
-          json({ ok: true });
-          return;
-        }
-        const access = await googleToken(uid);
-        // A deterministic Google event ID makes retries safe after interrupted requests.
-        const eventId = hash(`gpeit:${uid}:${t.id}`);
-        const response = await fetch(
-          "https://www.googleapis.com/calendar/v3/calendars/primary/events",
-          {
-            method: "POST",
-            signal: AbortSignal.timeout(20000),
-            headers: {
-              Authorization: `Bearer ${access}`,
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              id: eventId,
-              summary: t.title,
-              start: { dateTime: t.due },
-              end: {
-                dateTime: new Date(Date.parse(t.due) + 1800000).toISOString(),
-              },
-              reminders: t.remind
-                ? {
-                    useDefault: false,
-                    overrides: [
-                      {
-                        method: "popup",
-                        minutes: Math.max(
-                          0,
-                          Math.min(
-                            40320,
-                            Math.round(
-                              (Date.parse(t.due) - Date.parse(t.remind)) /
-                                60000,
-                            ),
-                          ),
-                        ),
-                      },
-                    ],
-                  }
-                : { useDefault: true },
-            }),
-          },
-        );
-        if (!response.ok && response.status !== 409)
-          fail(
-            502,
-            "Calendar could not save this event. Try reconnecting Google.",
+        if (!hasGoogleScope(uid, CALENDAR_SCOPE))
+          fail(409, "Connect Google Calendar first.");
+        if (!t.event_id) queueCalendar(t, "create");
+        else
+          run(
+            "UPDATE calendar_jobs SET next_attempt=0 WHERE event_id=? AND user_id=?",
+            t.event_id,
+            uid,
           );
-        run(
-          "UPDATE todos SET event_id=? WHERE id=? AND user_id=?",
-          eventId,
-          t.id,
-          uid,
-        );
-        json({ ok: true });
+        await processCalendarQueue();
+        json({
+          ok: true,
+          pending: !!one(
+            "SELECT event_id FROM calendar_jobs WHERE event_id=?",
+            one("SELECT event_id FROM todos WHERE id=?", t.id).event_id,
+          ),
+        });
         return;
       }
       if (!todo[2] && req.method === "PATCH") {
@@ -386,10 +536,30 @@ export const server = http.createServer(async (req, res) => {
         return;
       }
       if (!todo[2] && req.method === "DELETE") {
-        run("DELETE FROM todos WHERE id=? AND user_id=?", t.id, uid);
+        transaction(() => {
+          if (t.event_id) queueCalendar(t, "delete");
+          run("DELETE FROM todos WHERE id=? AND user_id=?", t.id, uid);
+        });
+        await processCalendarQueue();
         json({ ok: true });
         return;
       }
+    }
+    if (p === "/api/calendar/status" && req.method === "GET") {
+      json(
+        all(
+          "SELECT event_id,task_id,operation,attempts,last_error FROM calendar_jobs WHERE user_id=?",
+          uid,
+        ),
+      );
+      return;
+    }
+    if (p === "/api/calendar/retry" && req.method === "POST") {
+      rate(`calendar:${uid}`, 20);
+      run("UPDATE calendar_jobs SET next_attempt=0 WHERE user_id=?", uid);
+      await processCalendarQueue();
+      json({ ok: true });
+      return;
     }
     if (p === "/api/foods" && req.method === "GET") {
       json(
@@ -444,7 +614,19 @@ export const server = http.createServer(async (req, res) => {
       const b = await body(req);
       if (!tools.some((t) => t.id === b.tool)) fail(400, "Unknown tool.");
       const text = str(b.body, 2000);
-      if (b.email) {
+      const channel = b.channel || (b.email ? "email" : "inbox");
+      if (!["inbox", "email", "gmail"].includes(channel))
+        fail(400, "Choose a valid message channel.");
+      if (channel === "gmail") {
+        rate(`email:${uid}`, 10);
+        await sendGmail(
+          uid,
+          str(b.to || u.email, 254),
+          str(b.subject || `Gpeit · ${b.tool}`, 120),
+          text,
+        );
+      }
+      if (channel === "email") {
         rate(`email:${uid}`, 10);
         await sendEmail(u.email, `Gpeit · ${b.tool}`, text);
       }
@@ -524,7 +706,8 @@ export const server = http.createServer(async (req, res) => {
         client_id: process.env.GOOGLE_CLIENT_ID,
         redirect_uri: `${appUrl}/api/google/callback`,
         response_type: "code",
-        scope: "https://www.googleapis.com/auth/calendar.events",
+        scope: `${CALENDAR_SCOPE} ${GMAIL_SCOPE}`,
+        include_granted_scopes: "true",
         access_type: "offline",
         prompt: "consent",
         state,
@@ -564,16 +747,31 @@ export const server = http.createServer(async (req, res) => {
           "Google did not return offline access. Try connecting again.",
         );
       run(
-        "UPDATE settings SET google_refresh=? WHERE user_id=?",
+        "UPDATE settings SET google_refresh=?,google_scopes=? WHERE user_id=?",
         tokens.refresh_token,
+        tokens.scope || "",
         uid,
       );
+      // Backfill dated tasks created before Google was connected.
+      transaction(() => {
+        for (const t of all(
+          "SELECT * FROM todos WHERE user_id=? AND due IS NOT NULL AND event_id IS NULL",
+          uid,
+        )) {
+          if (hasGoogleScope(uid, CALENDAR_SCOPE)) queueCalendar(t, "create");
+        }
+      });
+      run("UPDATE calendar_jobs SET next_attempt=0 WHERE user_id=?", uid);
+      await processCalendarQueue();
       res.writeHead(302, { Location: "/?calendar=connected" });
       res.end();
       return;
     }
     if (p === "/api/google/disconnect" && req.method === "POST") {
-      run("UPDATE settings SET google_refresh=NULL WHERE user_id=?", uid);
+      run(
+        "UPDATE settings SET google_refresh=NULL,google_scopes='' WHERE user_id=?",
+        uid,
+      );
       json({ ok: true });
       return;
     }
@@ -605,9 +803,16 @@ export async function reminders() {
         `Reminder: ${t.title}`,
       );
       run("UPDATE todos SET reminded=1 WHERE id=?", t.id);
-      if (emailReady())
+      if (hasGoogleScope(t.user_id, GMAIL_SCOPE) || emailReady())
         try {
-          await sendEmail(t.email, "Gpeit · Task reminder", t.title);
+          if (hasGoogleScope(t.user_id, GMAIL_SCOPE))
+            await sendGmail(
+              t.user_id,
+              t.email,
+              "Gpeit · Task reminder",
+              t.title,
+            );
+          else await sendEmail(t.email, "Gpeit · Task reminder", t.title);
         } catch {
           run(
             "INSERT INTO messages(user_id,tool,body) VALUES(?,?,?)",
@@ -626,5 +831,9 @@ if (process.env.NODE_ENV !== "test") {
     console.log(`Gpeit running on port ${process.env.PORT || 3000}`),
   );
   reminders();
-  setInterval(reminders, 30000).unref();
+  processCalendarQueue().catch(() => console.error("Calendar queue failed"));
+  setInterval(() => {
+    reminders().catch(() => console.error("Reminder worker failed"));
+    processCalendarQueue().catch(() => console.error("Calendar queue failed"));
+  }, 30000).unref();
 }

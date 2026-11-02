@@ -19,6 +19,7 @@ let user,
   todos = [],
   foods = [],
   messages = [],
+  calendarSync = [],
   view = "overview",
   selectedDate = localDate(),
   authMode = "register";
@@ -74,10 +75,11 @@ async function load() {
   render();
 }
 async function refresh() {
-  [todos, foods, messages] = await Promise.all([
+  [todos, foods, messages, calendarSync] = await Promise.all([
     api("/todos"),
     api("/foods?date=" + selectedDate),
     api("/messages"),
+    api("/calendar/status"),
   ]);
 }
 const total = () => foods.reduce((n, f) => n + f.calories, 0);
@@ -148,6 +150,9 @@ function render() {
   $("#add-task")?.addEventListener("click", taskDialog);
   $("#add-food")?.addEventListener("click", foodDialog);
   $("#quick-food")?.addEventListener("click", foodDialog);
+  $("#retry-calendar")?.addEventListener("click", () =>
+    action(() => api("/calendar/retry", "POST")),
+  );
   $("#connect-google")?.addEventListener("click", connectGoogle);
   $("#disconnect-google")?.addEventListener("click", async () => {
     try {
@@ -158,24 +163,22 @@ function render() {
       toast(e.message);
     }
   });
-  document
-    .querySelectorAll("[data-toggle]")
-    .forEach(
-      (b) =>
-        (b.onclick = () =>
-          action(() =>
-            api("/todos/" + b.dataset.toggle, "PATCH", {
-              done: b.dataset.done !== "1",
-            }),
-          )),
-    );
+  document.querySelectorAll("[data-toggle]").forEach(
+    (b) =>
+      (b.onclick = () =>
+        action(() =>
+          api("/todos/" + b.dataset.toggle, "PATCH", {
+            done: b.dataset.done !== "1",
+          }),
+        )),
+  );
   document
     .querySelectorAll("[data-delete-task]")
     .forEach(
       (b) =>
         (b.onclick = () =>
           confirmDelete(
-            "Delete this task? Calendar events already created are kept in Google Calendar.",
+            "Delete this task and its linked Google Calendar event? Calendar changes retry automatically if Google is temporarily unavailable.",
             () => api("/todos/" + b.dataset.deleteTask, "DELETE"),
           )),
     );
@@ -244,10 +247,10 @@ function overview(pending, done) {
   }</section><section class="insight-card"><span class="spark">✦</span><div class="eyebrow">A FRESH PERSPECTIVE</div><h2>Your tools, with a little intelligence.</h2><p>Turn your tasks and food journal into useful insights with GPT analysis.</p><button data-ai="todos" class="secondary">Explore task insights →</button></section></div>`;
 }
 function taskRow(t) {
-  return `<div class="task-row ${t.done ? "completed" : ""}"><button class="check ${t.done ? "checked" : ""}" data-toggle="${t.id}" data-done="${t.done}" aria-label="${t.done ? "Reopen" : "Complete"} ${esc(t.title)}">${t.done ? "✓" : ""}</button><div class="task-content"><strong>${esc(t.title)}</strong><small>${t.due ? esc(new Date(t.due).toLocaleString()) : "No due date"}${t.remind ? " · Reminder set" : ""}${t.event_id ? " · In Google Calendar" : ""}</small></div>${!t.event_id && t.due ? `<button class="icon-button" data-calendar="${t.id}" title="Add to Google Calendar" aria-label="Add to Google Calendar">▦</button>` : ""}<button class="icon-button delete" data-delete-task="${t.id}" title="Delete task" aria-label="Delete task">×</button></div>`;
+  return `<div class="task-row ${t.done ? "completed" : ""}"><button class="check ${t.done ? "checked" : ""}" data-toggle="${t.id}" data-done="${t.done}" aria-label="${t.done ? "Reopen" : "Complete"} ${esc(t.title)}">${t.done ? "✓" : ""}</button><div class="task-content"><strong>${esc(t.title)}</strong><small>${t.due ? esc(new Date(t.due).toLocaleString()) : "No due date"}${t.remind ? " · Reminder set" : ""}${t.event_id ? (calendarSync.some((j) => j.event_id === t.event_id) ? " · Calendar sync pending" : " · In Google Calendar") : ""}</small></div>${!t.event_id && t.due ? `<button class="icon-button" data-calendar="${t.id}" title="Add to Google Calendar" aria-label="Add to Google Calendar">▦</button>` : ""}<button class="icon-button delete" data-delete-task="${t.id}" title="Delete task" aria-label="Delete task">×</button></div>`;
 }
 function todoView() {
-  return `<div class="integration-banner"><span>▦</span><div><strong>Keep your plans connected</strong><p>${user.integrations.google ? "Your Google Calendar is connected. Add dated tasks with the calendar button." : "Connect Google Calendar to add tasks and calendar reminders."}</p></div><button class="secondary" id="connect-google">${user.integrations.google ? "Reconnect" : "Connect calendar"} →</button></div><section class="card"><div class="section-heading"><h2>All tasks <span>${todos.length}</span></h2><div class="actions"><button class="secondary" data-message="todos">Send a note</button><button class="secondary" data-ai="todos">✦ AI analysis</button></div></div>${todos.length ? todos.map(taskRow).join("") : '<div class="empty"><span>✓</span><h3>A clear page, a fresh start.</h3><p>Add your first task and give it a little space to happen.</p></div>'}</section><p class="hint">Reminders arrive in your inbox while the app server is running. Email delivery is available when configured. Calendar events are copies; changes here do not change them.</p>`;
+  return `<div class="integration-banner"><span>▦</span><div><strong>Keep your plans connected</strong><p>${user.integrations.google ? "Dated tasks are added to Google Calendar automatically. Deleting a task removes its linked event." : "Connect Google to sync dated tasks and send messages through Gmail."}</p></div><button class="secondary" id="connect-google">${user.integrations.google ? "Reconnect" : "Connect calendar"} →</button></div><section class="card"><div class="section-heading"><h2>All tasks <span>${todos.length}</span></h2><div class="actions"><button class="secondary" data-message="todos">Send a note</button><button class="secondary" data-ai="todos">✦ AI analysis</button></div></div>${calendarSync.length ? `<div class="integration-banner"><div><strong>${calendarSync.length} Calendar change(s) pending</strong><p>${esc(calendarSync.find((j) => j.last_error)?.last_error || "Changes sync automatically while Google is connected.")}</p></div><button id="retry-calendar" class="secondary">Retry sync</button></div>` : ""}${todos.length ? todos.map(taskRow).join("") : '<div class="empty"><span>✓</span><h3>A clear page, a fresh start.</h3><p>Add your first task and give it a little space to happen.</p></div>'}</section><p class="hint">Tasks need a due date to appear on Google Calendar. Additions and deletions sync automatically; pending changes retry after connection failures. Reminders arrive in your inbox and through Gmail when connected. Changes made in Google Calendar do not change tasks here.</p>`;
 }
 function dietView() {
   return `<div class="diet-top"><section class="card calorie-card"><span class="eyebrow">DAILY INTAKE</span><h2>${total().toLocaleString()} <small>kcal</small></h2><progress max="${user.goal}" value="${total()}"></progress><p>${Math.max(0, user.goal - total()).toLocaleString()} kcal below your ${user.goal.toLocaleString()} kcal reference</p></section><section class="card"><h2>One meal at a time.</h2><p>Log the calories for the portion you ate. Your daily total updates automatically.</p><div class="actions"><button class="secondary" data-ai="diet">✦ AI analysis</button><button class="secondary" data-message="diet">Send a note</button></div></section></div><section class="card"><div class="section-heading"><h2>Food journal</h2><input type="date" id="food-date" aria-label="Journal date" value="${selectedDate}"></div>${foods.length ? foods.map((f) => `<div class="food-row"><span class="food-icon">◔</span><div class="task-content"><strong>${esc(f.name)}</strong><small>${esc(f.meal)}</small></div><strong>${f.calories} <small>kcal</small></strong><button class="icon-button delete" aria-label="Remove food entry" data-delete-food="${f.id}">×</button></div>`).join("") : '<div class="empty"><span>◔</span><h3>What’s on your plate?</h3><p>No food logged for this day yet.</p><button class="secondary" id="quick-food">＋ Log your first food</button></div>'}</section><p class="hint">Calories are entered by you. Your daily reference is a personal preference, not a medical recommendation.</p>`;
@@ -267,7 +270,8 @@ function settingsView() {
           : "Needs configuration",
     ],
     ["GPT analysis", i.ai ? "Available" : "Needs configuration"],
-    ["Email messages", i.email ? "Available" : "Needs configuration"],
+    ["Gmail sending", i.gmail ? "Connected" : "Reconnect Google to enable"],
+    ["Email service (optional)", i.email ? "Available" : "Needs configuration"],
   ]
     .map(
       ([name, status]) =>
@@ -275,7 +279,7 @@ function settingsView() {
     )
     .join(
       "",
-    )}<button class="secondary" id="connect-google">Connect Google Calendar →</button>${i.google ? '<button class="text-button" id="disconnect-google">Disconnect calendar</button>' : ""}</section><section class="card"><span class="spark">✳</span><h2>Built to grow.</h2><p>Every tool shares your account, messaging, and AI analysis. Add new tool definitions to expand your workspace.</p><p class="hint">An administrator configures optional services on the server. Credentials never belong in the browser.</p></section></div>`;
+    )}<button class="secondary" id="connect-google">Connect Google: Calendar & Gmail →</button>${i.google ? '<button class="text-button" id="disconnect-google">Disconnect Google</button>' : ""}</section><section class="card"><span class="spark">✳</span><h2>Built to grow.</h2><p>Every tool shares your account, messaging, and AI analysis. Add new tool definitions to expand your workspace.</p><p class="hint">An administrator configures optional services on the server. Credentials never belong in the browser.</p></section></div>`;
 }
 function openDialog(title, content, submit) {
   const d = $("#dialog");
@@ -313,12 +317,18 @@ function foodDialog() {
 function messageDialog(tool) {
   const f = openDialog(
     "Send a note from your tool",
-    `<label>Message<textarea name="body" required maxlength="2000" rows="4" placeholder="A note to your future self…"></textarea></label><label class="checkbox-label"><input type="checkbox" name="email"> Also email this to ${esc(user.email)}</label><p class="hint">The message is saved to your private inbox. Email requires a configured delivery service.</p>`,
+    `<label>Message<textarea name="body" required maxlength="2000" rows="4" placeholder="A note to your future self…"></textarea></label><label>Delivery<select name="channel"><option value="inbox">In-app inbox only</option><option value="gmail">Send through my Gmail</option>${user.integrations.email ? '<option value="email">Email service (to myself)</option>' : ""}</select></label><label>Recipient (Gmail)<input type="email" name="to" value="${esc(user.email)}" required></label><label>Subject<input name="subject" maxlength="120" value="Gpeit · ${tool === "todos" ? "To-do list" : "Food journal"}" required></label><p class="hint">The message is saved to your private inbox. Gmail sends from your connected Google account; reconnect Google first to grant sending permission.</p>`,
     "Send message",
   );
   f.onsubmit = (e) =>
     saveDialog(e, (b) =>
-      api("/messages", "POST", { tool, body: b.body, email: b.email === "on" }),
+      api("/messages", "POST", {
+        tool,
+        body: b.body,
+        channel: b.channel,
+        to: b.to,
+        subject: b.subject,
+      }),
     );
 }
 async function saveDialog(e, fn) {
@@ -352,7 +362,7 @@ async function action(fn) {
 async function connectGoogle() {
   if (!user.integrations.googleAvailable) {
     toast(
-      "Google Calendar needs OAuth credentials configured by the app administrator.",
+      "Google needs OAuth credentials configured by the app administrator.",
     );
     return;
   }
@@ -387,6 +397,11 @@ load().catch((e) => {
 setInterval(async () => {
   if (user)
     try {
+      const sync = await api("/calendar/status");
+      if (JSON.stringify(sync) !== JSON.stringify(calendarSync)) {
+        await refresh();
+        render();
+      }
       const next = await api("/messages");
       if (next.length !== messages.length) {
         messages = next;
