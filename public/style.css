@@ -1146,3 +1146,161 @@ dialog .wide {
     display: none;
   }
 }
+.task-status {
+  width: 125px;
+  flex-shrink: 0;
+  margin: 0;
+  padding: 7px 9px;
+  font-size: 11px;
+  border-radius: 20px;
+  background: #f2f4f1;
+}
+.task-status.in_progress {
+  background: #fff5dd;
+  color: #8e6a1e;
+}
+.task-status.done {
+  background: #eaf4e8;
+  color: #4e7956;
+}
+.cron-actions {
+  margin-bottom: 18px;
+}
+.cron-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: 20px;
+  margin-bottom: 24px;
+}
+.cron-card {
+  min-width: 0;
+}
+.cron-prompt {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 110px;
+  overflow: auto;
+  font-size: 12px;
+}
+.cron-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  font-size: 11px;
+  margin-top: 18px;
+  color: #7b8788;
+}
+.cron-meta code {
+  background: #f1f4ef;
+  padding: 4px 7px;
+  border-radius: 4px;
+}
+.cron-card .actions {
+  margin-top: 20px;
+  gap: 12px;
+}
+.cron-card .section-heading {
+  align-items: flex-start;
+}
+.cron-card .section-heading > span {
+  display: inline-block;
+  white-space: nowrap;
+}
+.run-log {
+  border-top: 1px solid var(--border);
+  padding: 18px 0;
+}
+.run-log summary {
+  cursor: pointer;
+  line-height: 2;
+  font-size: 12px;
+}
+.run-log summary small {
+  display: block;
+  margin-left: 18px;
+}
+.run-state {
+  font-size: 10px;
+  text-transform: capitalize;
+  border-radius: 20px;
+  padding: 5px 8px;
+  background: #f0f2ef;
+  margin-right: 8px;
+}
+.run-state.succeeded {
+  background: #e7f4e8;
+  color: #4b7856;
+}
+.run-state.failed,
+.run-state.interrupted {
+  background: #fbede8;
+  color: #a36351;
+}
+.run-state.running {
+  background: #f8f0d9;
+  color: #91702c;
+}
+.run-log pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding: 15px;
+  background: #f8f9f6;
+  border-radius: 7px;
+  line-height: 1.8;
+  font-family: inherit;
+  font-size: 12px;
+}
+.run-log dl {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--muted);
+  margin: 20px 0;
+}
+.run-log dd {
+  margin: 0;
+}
+.run-log strong {
+  font-size: 12px;
+}
+#task-filter {
+  width: auto;
+  margin: 0;
+  font-size: 11px;
+  padding: 8px;
+}
+.tool-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+.tool-card {
+  min-width: 0;
+}
+@media (max-width: 1200px) {
+  .tool-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .tool-grid .tool-card:last-child {
+    grid-column: 1/-1;
+  }
+}
+@media (max-width: 760px) {
+  .tool-grid {
+    grid-template-columns: 1fr;
+  }
+  .task-row {
+    flex-wrap: wrap;
+  }
+  .task-row .task-content {
+    min-width: 150px;
+  }
+  .task-status {
+    width: 116px;
+  }
+  .cron-card .section-heading > span {
+    display: block;
+  }
+  #run-history .section-heading {
+    flex-wrap: wrap;
+  }
+}

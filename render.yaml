@@ -6,7 +6,7 @@ services:
     runtime: node
     plan: starter
     numInstances: 1
-    buildCommand: node --version && npm test
+    buildCommand: npm ci && npm test
     startCommand: npm start
     healthCheckPath: /
     envVars:

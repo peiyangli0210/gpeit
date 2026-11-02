@@ -1,12 +1,13 @@
 # Gpeit
 
-A personal workspace for useful tools: private tasks, reminders, a food journal, tool messages, and optional GPT analysis. Built with Node 24's HTTP server and SQLite, with a responsive vanilla JavaScript frontend. No third-party runtime packages or build step.
+A personal workspace for useful tools: private tasks, reminders, a food journal, tool messages, and optional GPT analysis. Built with Node 24's HTTP server and SQLite, with a responsive vanilla JavaScript frontend. Cron schedules use the pinned `cron-parser` package for time-zone and daylight-saving support. No frontend build step is required.
 
 ## Run
 
 ```sh
 cd /workspace/gpeit
 node --version # Node 24 or newer
+npm ci
 npm test
 npm start
 ```
@@ -24,6 +25,26 @@ Open the deployment link, sign into Render, authorize GitHub access if requested
 After Render marks the service live, open its HTTPS URL and create an account, add/complete a task, log a food entry and verify its calorie total. Restart the service and confirm your data remains. Deployment is not verified until these checks pass on the hosted service. This is intended for private MVP testing; see the production limitations below before public signups.
 
 Add optional integration credentials through Render’s secure environment-variable settings; never place real keys in `render.yaml`. The core tools work before integrations are configured. Enable backups for the persistent data and keep the service at one instance until the database and worker are redesigned for multiple replicas.
+
+## Task status and GPT schedules
+
+Tasks have **Not started**, **In progress**, and **Done** statuses. Set the initial status when creating a task or change it from the task row; use the filter to view one status. Existing completed tasks migrate to Done and pending tasks to Not started. The quick completion button remains available. Only Done tasks stop reminders; completing a task keeps its Calendar event.
+
+**GPT schedules** is the third tool. Create a job with a name, custom prompt, five-field cron expression, IANA time zone and output-token limit (100–4,000). Save it enabled, or as a paused draft. Edit, pause/resume, run manually, delete, and view timestamped execution logs from the tool. Enable/run requires that user's own encrypted OpenAI API connection; shared administrator billing is never used. The model is the one selected in the owner's AI connection at execution time. ChatGPT subscriptions do not supply these API credits.
+
+Examples (interpreted in the job's chosen time zone):
+
+| Cron           | Schedule          |
+| -------------- | ----------------- |
+| `0 9 * * *`    | Every day at 9 AM |
+| `0 9 * * 1-5`  | Weekdays at 9 AM  |
+| `*/30 * * * *` | Every 30 minutes  |
+
+A suitable prompt is “Generate one creative writing idea and a short outline.” Jobs are text-generation requests, not executable shell cron commands or autonomous tool agents: they do not browse current sources, execute code or perform external actions. Results stay in the private job logs. The tool also supports manual notes/Gmail messages and analysis of recent run history.
+
+The single-instance server polls schedules every 15 seconds; it must remain running. Jobs and next-run times persist in SQLite. After downtime, one overdue occurrence is executed and older missed intervals are skipped. If the server restarts during a request, its log is marked **interrupted**, not automatically retried: the provider may already have billed it. Failed requests are logged and not automatically retried either; future scheduled occurrences continue unless paused. Review logs/API usage before manually repeating an uncertain execution.
+
+Logs include trigger, prompt snapshot, selected model, scheduled/start/finish times, output or safe error, and API token usage when reported. The latest 200 logs per job are retained, with paginated history. Deleting a job deletes its logs. Up to 20 jobs per user, 2 concurrent executions per user and 4 globally are supported. Active jobs cannot be edited/deleted until the current run finishes. Removing a personal API connection pauses all its owner's jobs; reconnecting does not automatically resume them. An already-running paid request may finish after removal. Set spending limits in the user's OpenAI API project for additional cost control.
 
 ## Optional services
 
@@ -53,7 +74,7 @@ Every data query must include the authenticated user ID from the server session,
 
 ## Validation
 
-`npm test` exercises real HTTP requests against a temporary database: account creation/login/logout, unauthorized requests, task completion, cross-user access denial, CSRF origin rejection, calorie totals and date isolation, preferences, messages, idempotent reminder processing, integration configuration errors, and frontend serving. The Google integration checks mock token exchanges, Gmail MIME messages and errors, OAuth scopes, automatic Calendar creates/deletes, retries, reconnection and cross-user ownership. Personal AI tests cover encrypted storage, per-user credentials/data/model isolation, safe failed verification, replacement, model changes, removal, production encryption prerequisites and avoiding implicit billing fallbacks. No live external API calls are made by the suite. A browser smoke check was also run against Chromium for registration, task creation/completion, food logging, messaging, and a 390px-wide layout.
+`npm test` exercises real HTTP requests against a temporary database: account creation/login/logout, unauthorized requests, task completion, cross-user access denial, CSRF origin rejection, calorie totals and date isolation, preferences, messages, idempotent reminder processing, integration configuration errors, and frontend serving. The Google integration checks mock token exchanges, Gmail MIME messages and errors, OAuth scopes, automatic Calendar creates/deletes, retries, reconnection and cross-user ownership. Personal AI tests cover encrypted storage, per-user credentials/data/model isolation, safe failed verification, replacement, model changes, removal, production encryption prerequisites and avoiding implicit billing fallbacks. Scheduler tests cover time zones/DST, valid and invalid cron expressions, status migrations, private logs, owner-specific API billing, duplicate prevention, concurrency, failures, pausing and interrupted-run recovery. No live external API calls are made by the suite. A browser smoke check was also run against Chromium for registration, task creation/completion, food logging, messaging, and a 390px-wide layout.
 
 ## Before public deployment
 

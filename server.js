@@ -9,6 +9,7 @@ import {
 import { mkdirSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { tools } from "./tools.js";
+import { createCronService } from "./cron-jobs.js";
 import { personalAIAvailable, encryptAIKey, decryptAIKey } from "./ai-keys.js";
 
 const root = fileURLToPath(new URL(".", import.meta.url));
@@ -37,6 +38,16 @@ if (
 ) {
   db.exec(
     "ALTER TABLE settings ADD COLUMN google_scopes TEXT NOT NULL DEFAULT 'https://www.googleapis.com/auth/calendar.events'",
+  );
+}
+if (
+  !db
+    .prepare("PRAGMA table_info(todos)")
+    .all()
+    .some((c) => c.name === "status")
+) {
+  db.exec(
+    "ALTER TABLE todos ADD COLUMN status TEXT NOT NULL DEFAULT 'not_started'; UPDATE todos SET status=CASE WHEN done=1 THEN 'done' ELSE 'not_started' END;",
   );
 }
 const run = (sql, ...p) => db.prepare(sql).run(...p);
@@ -364,6 +375,37 @@ async function openAI(path, key, options = {}) {
   }
   return response.json();
 }
+async function personalCompletion(uid, prompt, maxTokens) {
+  const connection = one("SELECT * FROM ai_connections WHERE user_id=?", uid);
+  if (!connection)
+    fail(
+      409,
+      "Your personal OpenAI API connection is missing. Reconnect it in Settings.",
+    );
+  const key = decryptAIKey(connection.encrypted_key, uid, dataDirectory);
+  const result = await openAI("responses", key, {
+    method: "POST",
+    body: JSON.stringify({
+      model: connection.model,
+      instructions:
+        "Run the user-defined prompt and return a useful result. You have no browser, external actions or shell tools. Do not claim to have performed actions or accessed live information.",
+      input: prompt,
+      max_output_tokens: maxTokens,
+    }),
+  });
+  const text = result.output
+    ?.flatMap((o) => o.content || [])
+    .filter((c) => c.type === "output_text")
+    .map((c) => c.text)
+    .join("\n");
+  if (!text)
+    fail(
+      502,
+      "No text was returned by this model. Choose a text-capable Responses API model or increase the output limit.",
+    );
+  return { text, model: connection.model, usage: result.usage };
+}
+export const cronService = createCronService(db, personalCompletion);
 const limits = new Map();
 function rate(key, max = 20) {
   const now = Date.now();
@@ -552,7 +594,10 @@ export const server = http.createServer(async (req, res) => {
       return;
     }
     if (p === "/api/ai-connection" && req.method === "DELETE") {
-      run("DELETE FROM ai_connections WHERE user_id=?", uid);
+      transaction(() => {
+        run("DELETE FROM ai_connections WHERE user_id=?", uid);
+        run("UPDATE cron_jobs SET enabled=0 WHERE user_id=?", uid);
+      });
       json(aiStatus(uid));
       return;
     }
@@ -564,10 +609,50 @@ export const server = http.createServer(async (req, res) => {
       json({ ok: true });
       return;
     }
+    if (p === "/api/cron/jobs" && req.method === "GET") {
+      json(cronService.list(uid));
+      return;
+    }
+    if (p === "/api/cron/jobs" && req.method === "POST") {
+      rate(`cron-config:${uid}`, 40);
+      json(cronService.create(uid, await body(req)), 201);
+      return;
+    }
+    const cronRoute = p.match(/^\/api\/cron\/jobs\/(\d+)(?:\/(runs|run))?$/);
+    if (cronRoute) {
+      const id = Number(cronRoute[1]);
+      if (cronRoute[2] === "runs" && req.method === "GET") {
+        json(
+          cronService.history(
+            uid,
+            id,
+            url.searchParams.has("before")
+              ? Number(url.searchParams.get("before"))
+              : undefined,
+          ),
+        );
+        return;
+      }
+      if (cronRoute[2] === "run" && req.method === "POST") {
+        rate(`cron-run:${uid}`, 20);
+        json(cronService.runNow(uid, id), 202);
+        return;
+      }
+      if (!cronRoute[2] && req.method === "PATCH") {
+        rate(`cron-config:${uid}`, 40);
+        json(cronService.update(uid, id, await body(req)));
+        return;
+      }
+      if (!cronRoute[2] && req.method === "DELETE") {
+        cronService.remove(uid, id);
+        json({ ok: true });
+        return;
+      }
+    }
     if (p === "/api/todos" && req.method === "GET") {
       json(
         all(
-          "SELECT * FROM todos WHERE user_id=? ORDER BY done, due IS NULL, due, id DESC",
+          "SELECT * FROM todos WHERE user_id=? ORDER BY done, status, due IS NULL, due, id DESC",
           uid,
         ),
       );
@@ -578,16 +663,21 @@ export const server = http.createServer(async (req, res) => {
         title = str(b.title),
         due = instant(b.due),
         remind = instant(b.remind);
+      const status = b.status ?? "not_started";
+      if (!["not_started", "in_progress", "done"].includes(status))
+        fail(400, "Choose a valid task status.");
       if (remind && Date.parse(remind) < Date.now())
         fail(400, "Set a reminder in the future.");
       const id = transaction(() => {
         const id = Number(
           run(
-            "INSERT INTO todos(user_id,title,due,remind) VALUES(?,?,?,?)",
+            "INSERT INTO todos(user_id,title,due,remind,status,done) VALUES(?,?,?,?,?,?)",
             uid,
             title,
             due,
             remind,
+            status,
+            status === "done" ? 1 : 0,
           ).lastInsertRowid,
         );
         if (due && hasGoogleScope(uid, CALENDAR_SCOPE))
@@ -630,10 +720,19 @@ export const server = http.createServer(async (req, res) => {
       }
       if (!todo[2] && req.method === "PATCH") {
         const b = await body(req);
-        if (typeof b.done !== "boolean") fail(400, "Invalid task state.");
+        const status =
+          b.status ??
+          (typeof b.done === "boolean"
+            ? b.done
+              ? "done"
+              : "not_started"
+            : null);
+        if (!["not_started", "in_progress", "done"].includes(status))
+          fail(400, "Choose Not started, In progress, or Done.");
         run(
-          "UPDATE todos SET done=? WHERE id=? AND user_id=?",
-          b.done ? 1 : 0,
+          "UPDATE todos SET done=?,status=? WHERE id=? AND user_id=?",
+          status === "done" ? 1 : 0,
+          status,
           t.id,
           uid,
         );
@@ -764,17 +863,27 @@ export const server = http.createServer(async (req, res) => {
       const b = await body(req),
         tool = tools.find((t) => t.id === b.tool);
       if (!tool) fail(400, "Unknown tool.");
+      if (tool.id === "cron" && !connection)
+        fail(
+          409,
+          "Scheduled job analysis requires your personal OpenAI API connection.",
+        );
       const data =
         tool.id === "todos"
           ? all(
-              "SELECT title,due,done FROM todos WHERE user_id=? LIMIT 100",
+              "SELECT title,due,status FROM todos WHERE user_id=? LIMIT 100",
               uid,
             )
-          : all(
-              "SELECT name,calories,meal,date FROM foods WHERE user_id=? AND date=?",
-              uid,
-              date(b.date),
-            );
+          : tool.id === "cron"
+            ? all(
+                "SELECT cron_jobs.name,cron_runs.status,substr(cron_runs.output,1,2000) AS output,cron_runs.error,cron_runs.started FROM cron_runs JOIN cron_jobs ON cron_jobs.id=cron_runs.job_id WHERE cron_runs.user_id=? ORDER BY cron_runs.id DESC LIMIT 10",
+                uid,
+              )
+            : all(
+                "SELECT name,calories,meal,date FROM foods WHERE user_id=? AND date=?",
+                uid,
+                date(b.date),
+              );
       const result = await openAI("responses", key, {
         method: "POST",
         body: JSON.stringify({
@@ -942,6 +1051,14 @@ if (process.env.NODE_ENV !== "test") {
     console.log(`Gpeit running on port ${process.env.PORT || 3000}`),
   );
   reminders();
+  cronService.tick();
+  setInterval(() => {
+    try {
+      cronService.tick();
+    } catch {
+      console.error("Scheduled job polling failed");
+    }
+  }, 15000).unref();
   processCalendarQueue().catch(() => console.error("Calendar queue failed"));
   setInterval(() => {
     reminders().catch(() => console.error("Reminder worker failed"));
