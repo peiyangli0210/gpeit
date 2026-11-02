@@ -15,9 +15,28 @@ const localDate = () => {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 };
+function shiftDay(day, amount) {
+  const d = new Date(`${day}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + amount);
+  return d.toISOString().slice(0, 10);
+}
+function mondayOf(day) {
+  return shiftDay(day, -((new Date(`${day}T00:00:00Z`).getUTCDay() + 6) % 7));
+}
+const upcomingWeek = () => shiftDay(mondayOf(localDate()), 7);
+const displayDay = (day, options = { month: "short", day: "numeric" }) =>
+  new Date(`${day}T12:00:00Z`).toLocaleDateString(undefined, {
+    ...options,
+    timeZone: "UTC",
+  });
 let user,
   todos = [],
   foods = [],
+  foodHistory = [],
+  foodPlans = [],
+  historyStart = shiftDay(localDate(), -29),
+  historyEnd = localDate(),
+  planStart = upcomingWeek(),
   messages = [],
   calendarSync = [],
   cronJobs = [],
@@ -80,13 +99,19 @@ async function load() {
   render();
 }
 async function refresh() {
-  [todos, foods, messages, calendarSync, cronJobs] = await Promise.all([
-    api("/todos"),
-    api("/foods?date=" + selectedDate),
-    api("/messages"),
-    api("/calendar/status"),
-    api("/cron/jobs"),
-  ]);
+  let history, plans;
+  [todos, foods, messages, calendarSync, cronJobs, history, plans] =
+    await Promise.all([
+      api("/todos"),
+      api("/foods?date=" + selectedDate),
+      api("/messages"),
+      api("/calendar/status"),
+      api("/cron/jobs"),
+      api(`/foods/history?start=${historyStart}&end=${historyEnd}`),
+      api(`/food-plans?start=${planStart}&end=${shiftDay(planStart, 6)}`),
+    ]);
+  foodHistory = history.days;
+  foodPlans = plans;
   if (selectedCronId && cronJobs.some((j) => j.id === selectedCronId)) {
     const logs = await api(`/cron/jobs/${selectedCronId}/runs`);
     cronRuns = logs.runs;
@@ -259,8 +284,8 @@ function render() {
       toast(e.message);
     }
   });
-  $("#add-food")?.addEventListener("click", foodDialog);
-  $("#quick-food")?.addEventListener("click", foodDialog);
+  $("#add-food")?.addEventListener("click", () => foodDialog());
+  $("#quick-food")?.addEventListener("click", () => foodDialog());
   $("#retry-calendar")?.addEventListener("click", () =>
     action(() => api("/calendar/retry", "POST")),
   );
@@ -317,15 +342,94 @@ function render() {
   document
     .querySelectorAll("[data-message]")
     .forEach((b) => (b.onclick = () => messageDialog(b.dataset.message)));
-  $("#food-date")?.addEventListener("change", async (e) => {
-    selectedDate = e.target.value || localDate();
-    try {
-      await refresh();
-      render();
-    } catch (err) {
-      toast(err.message);
-    }
+  $("#food-date")?.addEventListener("change", (e) =>
+    selectJournalDate(e.target.value || localDate()),
+  );
+  $("#journal-today")?.addEventListener("click", () =>
+    selectJournalDate(localDate()),
+  );
+  $("#log-past-food")?.addEventListener("click", () =>
+    foodDialog(null, shiftDay(localDate(), -1)),
+  );
+  $("#jump-planner")?.addEventListener("click", () =>
+    $("#meal-planner").scrollIntoView({ behavior: "smooth" }),
+  );
+  document
+    .querySelectorAll("[data-edit-food]")
+    .forEach(
+      (b) =>
+        (b.onclick = () =>
+          foodDialog(foods.find((f) => f.id === Number(b.dataset.editFood)))),
+    );
+  document.querySelectorAll("[data-history-date]").forEach((b) => {
+    const select = () => selectJournalDate(b.dataset.historyDate, true);
+    b.onclick = select;
+    if (b.tagName.toLowerCase() === "g")
+      b.onkeydown = (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          select();
+        }
+      };
   });
+  document
+    .querySelectorAll("[data-history-days]")
+    .forEach(
+      (b) =>
+        (b.onclick = () =>
+          setHistoryRange(
+            shiftDay(localDate(), 1 - Number(b.dataset.historyDays)),
+            localDate(),
+          )),
+    );
+  $("#history-range")?.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const b = Object.fromEntries(new FormData(e.target));
+    setHistoryRange(b.start, b.end);
+  });
+  $("#add-plan")?.addEventListener("click", () => planDialog());
+  document
+    .querySelectorAll("[data-plan-date]")
+    .forEach((b) => (b.onclick = () => planDialog(null, b.dataset.planDate)));
+  document
+    .querySelectorAll("[data-edit-plan]")
+    .forEach(
+      (b) =>
+        (b.onclick = () =>
+          planDialog(
+            foodPlans.find((f) => f.id === Number(b.dataset.editPlan)),
+          )),
+    );
+  document
+    .querySelectorAll("[data-delete-plan]")
+    .forEach(
+      (b) =>
+        (b.onclick = () =>
+          confirmDelete(
+            "Remove this planned meal? Logged food and historical calorie totals will stay as they are.",
+            () => api("/food-plans/" + b.dataset.deletePlan, "DELETE"),
+          )),
+    );
+  document
+    .querySelectorAll("[data-plan-week]")
+    .forEach(
+      (b) =>
+        (b.onclick = () =>
+          changePlanWeek(shiftDay(planStart, Number(b.dataset.planWeek)))),
+    );
+  $("#plan-upcoming")?.addEventListener("click", () =>
+    changePlanWeek(upcomingWeek()),
+  );
+  $("#plan-week-date")?.addEventListener("change", (e) => {
+    if (e.target.value) changePlanWeek(mondayOf(e.target.value));
+  });
+  $("#analyze-plan")?.addEventListener("click", (e) =>
+    analyze("diet", e.currentTarget, {
+      scope: "plan",
+      start: planStart,
+      end: shiftDay(planStart, 6),
+    }),
+  );
   $("#ai-form")?.addEventListener("submit", async (e) => {
     e.preventDefault();
     const form = e.target,
@@ -425,7 +529,99 @@ function todoView() {
   }</section><p class="hint">Tasks need a due date to appear on Google Calendar. Additions and deletions sync automatically; pending changes retry after connection failures. Reminders arrive in your inbox and through Gmail when connected. Changes made in Google Calendar do not change tasks here.</p>`;
 }
 function dietView() {
-  return `<div class="diet-top"><section class="card calorie-card"><span class="eyebrow">DAILY INTAKE</span><h2>${total().toLocaleString()} <small>kcal</small></h2><progress max="${user.goal}" value="${total()}"></progress><p>${Math.max(0, user.goal - total()).toLocaleString()} kcal below your ${user.goal.toLocaleString()} kcal reference</p></section><section class="card"><h2>One meal at a time.</h2><p>Log the calories for the portion you ate. Your daily total updates automatically.</p><div class="actions"><button class="secondary" data-ai="diet">✦ AI analysis</button><button class="secondary" data-message="diet">Send a note</button></div></section></div><section class="card"><div class="section-heading"><h2>Food journal</h2><input type="date" id="food-date" aria-label="Journal date" value="${selectedDate}"></div>${foods.length ? foods.map((f) => `<div class="food-row"><span class="food-icon">◔</span><div class="task-content"><strong>${esc(f.name)}</strong><small>${esc(f.meal)}</small></div><strong>${f.calories} <small>kcal</small></strong><button class="icon-button delete" aria-label="Remove food entry" data-delete-food="${f.id}">×</button></div>`).join("") : '<div class="empty"><span>◔</span><h3>What’s on your plate?</h3><p>No food logged for this day yet.</p><button class="secondary" id="quick-food">＋ Log your first food</button></div>'}</section><p class="hint">Calories are entered by you. Your daily reference is a personal preference, not a medical recommendation.</p>`;
+  const difference = user.goal - total();
+  return `<div class="diet-top"><section class="card calorie-card"><span class="eyebrow">LOGGED INTAKE · ${esc(displayDay(selectedDate))}</span><h2>${total().toLocaleString()} <small>kcal</small></h2><progress max="${user.goal}" value="${total()}"></progress><p>${Math.abs(difference).toLocaleString()} kcal ${difference >= 0 ? "below" : "above"} your ${user.goal.toLocaleString()} kcal reference</p></section><section class="card"><h2>Every day has a story.</h2><p>Forgot to log a meal? Add it to the date you ate it. Plan next week's meals separately below.</p><div class="actions"><button class="secondary" id="log-past-food">Log a past meal</button><button class="secondary" id="jump-planner">View food plan →</button><button class="secondary" data-ai="diet">✦ Analyze selected day</button><button class="secondary" data-message="diet">Send a note</button></div></section></div>
+  ${historyChart()}
+  <section class="card" id="journal-section"><div class="section-heading"><div><h2>Food journal</h2><p class="hint">${esc(displayDay(selectedDate, { weekday: "long", year: "numeric", month: "long", day: "numeric" }))} · ${foods.length} entries</p></div><div class="actions"><button class="text-button" id="journal-today">Today</button><input type="date" id="food-date" aria-label="Journal date" value="${selectedDate}"></div></div>${foods.length ? foods.map((f) => `<div class="food-row"><span class="food-icon">◔</span><div class="task-content"><strong>${esc(f.name)}</strong><small>${esc(f.meal)}</small></div><strong>${f.calories} <small>kcal</small></strong><button class="text-button" data-edit-food="${f.id}" aria-label="Edit food ${esc(f.name)}">Edit</button><button class="icon-button delete" aria-label="Remove food entry" data-delete-food="${f.id}">×</button></div>`).join("") : '<div class="empty"><span>◔</span><h3>What’s on your plate?</h3><p>No food logged for this day yet. You can add past meals too.</p><button class="secondary" id="quick-food">＋ Log food for this day</button></div>'}</section>
+  ${weeklyPlan()}
+  <p class="hint">Only logged food counts toward historical intake. Planned meals are not counted as eaten. Calories are entered by you; your reference is a personal preference, not a medical recommendation.</p>`;
+}
+function historyChart() {
+  const days = foodHistory,
+    logged = days.filter((d) => d.entries > 0),
+    sum = days.reduce((n, d) => n + d.calories, 0);
+  const width = 900,
+    height = 260,
+    left = 55,
+    right = 18,
+    top = 22,
+    bottom = 205,
+    plot = width - left - right;
+  const peak = Math.max(user.goal, ...days.map((d) => d.calories), 100),
+    max = Math.ceil((peak * 1.1) / 500) * 500;
+  const y = (value) => bottom - (value / max) * (bottom - top),
+    step = plot / Math.max(days.length, 1),
+    bar = Math.max(2, step * 0.66);
+  const grid = [0, max / 2, max]
+    .map(
+      (value) =>
+        `<line class="chart-grid" x1="${left}" y1="${y(value)}" x2="${width - right}" y2="${y(value)}"/><text class="chart-label" x="${left - 10}" y="${y(value) + 4}" text-anchor="end">${value.toLocaleString()}</text>`,
+    )
+    .join("");
+  const bars = days
+    .map((day, i) => {
+      const x = left + step * i + (step - bar) / 2,
+        label = day.entries
+          ? `${day.date}: ${day.calories} kcal from ${day.entries} food entries`
+          : `${day.date}: no food logged`;
+      return `<g class="chart-day" tabindex="0" role="button" aria-label="${esc(label)}. Open this day" data-history-date="${day.date}"><title>${esc(label)}</title><rect class="chart-hit" x="${left + step * i}" y="${top}" width="${step}" height="${bottom - top}"/><rect class="calorie-bar ${day.entries ? "" : "no-entry"} ${day.date === selectedDate ? "selected" : ""}" x="${x}" y="${day.calories ? y(day.calories) : bottom - 3}" width="${bar}" height="${day.calories ? bottom - y(day.calories) : 3}" rx="2"/>${i % Math.ceil(days.length / 7) === 0 || i === days.length - 1 ? `<text class="chart-label" x="${left + step * (i + 0.5)}" y="230" text-anchor="middle">${esc(displayDay(day.date))}</text>` : ""}</g>`;
+    })
+    .join("");
+  return `<section class="card food-history"><div class="section-heading"><div><h2>Calorie history</h2><p class="hint">Daily logged intake · click a day to view or add food</p></div><div class="actions">${[7, 30, 90].map((n) => `<button class="secondary" data-history-days="${n}">Last ${n} days</button>`).join("")}</div></div><form id="history-range" class="history-controls"><label>History from<input name="start" type="date" required value="${historyStart}"></label><label>History to<input name="end" type="date" required value="${historyEnd}"></label><button class="secondary">Apply range</button></form><div class="history-summary"><span><strong>${sum.toLocaleString()}</strong> kcal logged</span><span><strong>${logged.length ? Math.round(sum / logged.length).toLocaleString() : "—"}</strong> kcal average on logged days</span><span><strong>${logged.length}/${days.length}</strong> days logged</span></div><div class="chart-scroll"><svg class="calorie-chart" viewBox="0 0 ${width} ${height}" role="group" aria-labelledby="history-title history-description"><title id="history-title">Daily calorie intake from ${historyStart} to ${historyEnd}</title><desc id="history-description">Green bars show logged calories. Gray marks mean no food was logged. The dashed line shows your current reference of ${user.goal} kcal. Each day is a button that opens the journal.</desc>${grid}<line class="chart-reference" x1="${left}" y1="${y(user.goal)}" x2="${width - right}" y2="${y(user.goal)}"/>${bars}</svg></div><p class="hint">Green: logged intake · Gray: no entries · Dashed line: current ${user.goal.toLocaleString()} kcal reference. Missing entries do not mean zero food intake.</p><details class="history-table"><summary>View daily totals as a table</summary><table><thead><tr><th>Date</th><th>Logged kcal</th><th>Entries</th></tr></thead><tbody>${days.map((d) => `<tr><td><button class="text-button" data-history-date="${d.date}">${esc(displayDay(d.date, { year: "numeric", month: "short", day: "numeric" }))}</button></td><td>${d.entries ? d.calories.toLocaleString() : "Not logged"}</td><td>${d.entries}</td></tr>`).join("")}</tbody></table></details></section>`;
+}
+function weeklyPlan() {
+  const week = Array.from({ length: 7 }, (_, i) => shiftDay(planStart, i)),
+    sum = foodPlans.reduce((n, f) => n + f.calories, 0);
+  return `<section class="card meal-planner" id="meal-planner"><div class="section-heading"><div><h2>Weekly food plan</h2><p class="hint">${esc(displayDay(planStart))} – ${esc(displayDay(week[6], { year: "numeric", month: "short", day: "numeric" }))} · ${sum.toLocaleString()} kcal planned</p></div><div class="actions"><button class="secondary" id="analyze-plan">✦ AI review plan</button><button class="primary" id="add-plan">＋ Plan a meal</button></div></div><div class="planner-controls"><button class="secondary" data-plan-week="-7" aria-label="Previous plan week">← Previous</button><label>Week of<input type="date" id="plan-week-date" value="${planStart}"></label><button class="secondary" data-plan-week="7" aria-label="Next plan week">Next →</button><button class="text-button" id="plan-upcoming">Upcoming week</button></div><div class="week-plan-grid">${week
+    .map((day) => {
+      const meals = foodPlans
+          .filter((f) => f.date === day)
+          .sort(
+            (a, b) =>
+              ["Breakfast", "Lunch", "Dinner", "Snack"].indexOf(a.meal) -
+              ["Breakfast", "Lunch", "Dinner", "Snack"].indexOf(b.meal),
+          ),
+        total = meals.reduce((n, f) => n + f.calories, 0);
+      return `<article class="plan-day"><div class="plan-day-heading"><strong>${esc(displayDay(day, { weekday: "short" }))}</strong><span>${esc(displayDay(day))}</span></div><div class="plan-day-total">${total.toLocaleString()} <small>kcal planned</small></div>${meals.length ? meals.map((f) => `<div class="planned-meal"><small>${esc(f.meal)}</small><strong>${esc(f.name)}</strong><span>${f.calories.toLocaleString()} kcal</span><div class="actions"><button class="text-button" data-edit-plan="${f.id}" aria-label="Edit planned meal ${esc(f.name)}">Edit</button><button class="text-button" data-delete-plan="${f.id}" aria-label="Delete planned meal ${esc(f.name)}">Remove</button></div></div>`).join("") : '<p class="hint">No meals planned</p>'}<button class="text-button add-day-plan" data-plan-date="${day}" aria-label="Plan food for ${day}">＋ Add meal</button></article>`;
+    })
+    .join(
+      "",
+    )}</div><p class="hint">Planned calories stay separate from your journal. Log the actual meal on the day you eat it. Use the week controls to prepare future weeks or review past plans.</p></section>`;
+}
+async function selectJournalDate(day, scroll = false) {
+  const previous = selectedDate;
+  selectedDate = day;
+  try {
+    await refresh();
+    render();
+    if (scroll) $("#journal-section").scrollIntoView({ behavior: "smooth" });
+  } catch (e) {
+    selectedDate = previous;
+    toast(e.message);
+  }
+}
+async function setHistoryRange(start, end) {
+  const previous = [historyStart, historyEnd];
+  historyStart = start;
+  historyEnd = end;
+  try {
+    await refresh();
+    render();
+  } catch (e) {
+    [historyStart, historyEnd] = previous;
+    toast(e.message);
+  }
+}
+async function changePlanWeek(start) {
+  const previous = planStart;
+  planStart = start;
+  try {
+    await refresh();
+    render();
+  } catch (e) {
+    planStart = previous;
+    toast(e.message);
+  }
 }
 function inboxView() {
   return `<section class="card">${messages.length ? messages.map((m) => `<article class="message"><span class="tool-icon ${m.tool === "todos" ? "mint" : m.tool === "cron" ? "lavender" : "peach"}">${m.tool === "todos" ? "✓" : m.tool === "cron" ? "◷" : "◔"}</span><div><small>${esc(user.tools.find((t) => t.id === m.tool)?.name || m.tool)} · ${esc(new Date(m.created.replace(" ", "T") + "Z").toLocaleString())}</small><p>${esc(m.body)}</p></div></article>`).join("") : '<div class="empty"><span>▤</span><h3>All quiet for now.</h3><p>Your tool reminders, messages, and AI analyses will appear here.</p></div>'}</section>`;
@@ -515,16 +711,41 @@ function taskDialog() {
       });
     });
 }
-function foodDialog() {
-  const f = openDialog(
-    "A little fuel for your day",
-    `<label>Food or meal<input name="name" required maxlength="200" placeholder="e.g. Oatmeal with blueberries" autofocus></label><div class="form-grid"><label>Calories (kcal)<input name="calories" type="number" min="0" max="20000" required placeholder="320"></label><label>Meal<select name="meal"><option>Breakfast</option><option>Lunch</option><option>Dinner</option><option>Snack</option></select></label></div><label>Date<input name="date" type="date" required value="${selectedDate}"></label>`,
-    "Save food",
+function foodDialog(entry = null, presetDate = selectedDate) {
+  const form = openDialog(
+    entry ? "Edit logged food" : "Log food · any date",
+    `<label>Food or meal<input name="name" required maxlength="200" value="${esc(entry?.name || "")}" placeholder="e.g. Oatmeal with blueberries" autofocus></label><div class="form-grid"><label>Calories (kcal)<input name="calories" type="number" min="0" max="20000" required value="${entry?.calories ?? ""}" placeholder="320"></label><label>Meal<select name="meal" aria-label="Meal">${["Breakfast", "Lunch", "Dinner", "Snack"].map((meal) => `<option ${entry?.meal === meal ? "selected" : ""}>${meal}</option>`).join("")}</select></label></div><label>Eaten date<input name="date" type="date" required value="${entry?.date || presetDate}"></label><p class="hint">Choose the date you ate this food. Past dates are welcome; totals and the history chart update for that day.</p>`,
+    entry ? "Update food" : "Save food",
   );
-  f.onsubmit = (e) =>
-    saveDialog(e, (b) =>
-      api("/foods", "POST", { ...b, calories: Number(b.calories) }),
-    );
+  form.onsubmit = (e) =>
+    saveDialog(e, async (b) => {
+      await api(
+        "/foods" + (entry ? "/" + entry.id : ""),
+        entry ? "PATCH" : "POST",
+        { ...b, calories: Number(b.calories) },
+      );
+      selectedDate = b.date;
+      if (b.date < historyStart || b.date > historyEnd) {
+        historyEnd = b.date;
+        historyStart = shiftDay(b.date, -29);
+      }
+    });
+}
+function planDialog(entry = null, presetDate = planStart) {
+  const form = openDialog(
+    entry ? "Edit planned meal" : "Plan a meal",
+    `<label>Planned food or meal<input name="name" required maxlength="200" value="${esc(entry?.name || "")}" placeholder="e.g. Salmon, rice and vegetables"></label><div class="form-grid"><label>Planned calories (kcal)<input name="calories" type="number" min="0" max="20000" required value="${entry?.calories ?? ""}"></label><label>Meal<select name="meal" aria-label="Planned meal">${["Breakfast", "Lunch", "Dinner", "Snack"].map((meal) => `<option ${entry?.meal === meal ? "selected" : ""}>${meal}</option>`).join("")}</select></label></div><label>Plan date<input name="date" type="date" required value="${entry?.date || presetDate}"></label><p class="hint">This is a plan. It will not add calories to your logged intake.</p>`,
+    entry ? "Update planned meal" : "Save planned meal",
+  );
+  form.onsubmit = (e) =>
+    saveDialog(e, async (b) => {
+      await api(
+        "/food-plans" + (entry ? "/" + entry.id : ""),
+        entry ? "PATCH" : "POST",
+        { ...b, calories: Number(b.calories) },
+      );
+      planStart = mondayOf(b.date);
+    });
 }
 function messageDialog(tool) {
   const f = openDialog(
@@ -580,11 +801,15 @@ async function connectGoogle() {
   }
   location.href = "/api/google/connect";
 }
-async function analyze(tool, button) {
+async function analyze(tool, button, options = {}) {
   button.disabled = true;
   button.textContent = "Thinking…";
   try {
-    const r = await api("/analyze", "POST", { tool, date: selectedDate });
+    const r = await api("/analyze", "POST", {
+      tool,
+      date: selectedDate,
+      ...options,
+    });
     const f = openDialog(
       "✦ A fresh perspective",
       `<div class="analysis">${esc(r.text)}</div>`,
